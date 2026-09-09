@@ -19,6 +19,14 @@ Contributions are welcome! Feel free to:
 * Report issues: [GitHub Issues](https://github.com/sikienzl/python-stock-data-fetcher/issues)
 * Submit pull requests for improvements.
 
+## Project Structure
+The codebase uses a single package root under `src/trading/` for application logic:
+
+* `src/trading/core/` - data fetching, storage, alerts, backtesting, portfolio, and provider comparison
+* `src/trading/providers/` - Finnhub and Alpha Vantage integrations
+* `src/trading/analysis/` - technical indicators and analysis helpers
+* `src/cli.py` - command line entry point
+
 ## Configuration
 1. Add your API keys to a `.env` file:
 ```
@@ -68,6 +76,46 @@ python3 src/cli.py portfolio-list
 python3 src/cli.py portfolio-value
 python3 src/cli.py compare
 ```
+
+## **Advanced Workflow Additions**
+The CLI now includes extra commands for the next growth steps:
+
+* `portfolio-metrics` for ROI, Sharpe ratio, and max drawdown.
+* `alert-send` for Telegram or email notification hooks.
+* `export` for CSV or JSON output.
+* `backtest-compare` for comparing multiple strategies.
+* `risk` for stop-loss and position sizing.
+* `candles` for simple candlestick pattern detection.
+* `dashboard` for the local web server.
+
+Example usage:
+```bash
+python3 src/cli.py portfolio-metrics
+python3 src/cli.py alert-send
+python3 src/cli.py export
+python3 src/cli.py backtest-compare
+python3 src/cli.py risk
+python3 src/cli.py candles
+python3 src/cli.py dashboard
+```
+
+## **Local Web Dashboard**
+The project now includes a lightweight web dashboard that runs without extra dependencies.
+
+* Default URL: `http://0.0.0.0:8000`
+* Works well on a Raspberry Pi or in Docker
+* Shows portfolio metrics, alerts, recent stored quotes, and quick API actions
+
+Run it with:
+```bash
+python3 src/cli.py dashboard
+```
+
+Available JSON endpoints:
+* `GET /api/quotes`
+* `GET /api/alerts`
+* `GET /api/portfolio`
+* `GET /api/compare?symbol=AAPL`
 
 ## **Advanced Features**
 * Price alerts are stored in SQLite and can be evaluated against live prices.

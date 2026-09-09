@@ -42,6 +42,33 @@ def create_price_alert(
         return int(cursor.lastrowid)
 
 
+def update_price_alert(
+    alert_id: int,
+    symbol: str,
+    operator: str,
+    target_price: float,
+    active: bool = True,
+    db_path: str | Path | None = None,
+) -> None:
+    if operator not in {">", "<", ">=", "<="}:
+        raise ValueError("operator must be one of >, <, >=, <=")
+
+    with _connect(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE price_alerts
+            SET symbol = ?, operator = ?, target_price = ?, active = ?
+            WHERE id = ?
+            """,
+            (symbol.upper(), operator, target_price, int(active), alert_id),
+        )
+
+
+def delete_price_alert(alert_id: int, db_path: str | Path | None = None) -> None:
+    with _connect(db_path) as connection:
+        connection.execute("DELETE FROM price_alerts WHERE id = ?", (alert_id,))
+
+
 def list_price_alerts(db_path: str | Path | None = None) -> list[dict]:
     with _connect(db_path) as connection:
         rows = connection.execute(
