@@ -182,6 +182,8 @@ def portfolio_import_csv(file_path, source, replace):
             rows=result["rows"],
         )
     )
+    if result.get("unresolved"):
+        click.echo("Unresolved: " + ", ".join(result["unresolved"]))
 
 
 @cli.command("portfolio-import-pdf")
@@ -199,6 +201,8 @@ def portfolio_import_pdf(file_path, source, replace):
             rows=result["rows"],
         )
     )
+    if result.get("unresolved"):
+        click.echo("Unresolved: " + ", ".join(result["unresolved"]))
 
 
 @cli.command()

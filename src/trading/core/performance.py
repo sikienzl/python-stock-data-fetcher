@@ -20,6 +20,7 @@ ING_SYMBOL_ALIASES: dict[str, list[str]] = {
     "BASF11": ["BASF", "BAS.DE", "BAS"],
     "519000": ["BMW", "BMW.DE", "BMW"],
     "A0WMPJ": ["Aixtron", "AIXA.DE", "AIXA"],
+    "RENK73": ["RENK", "RENK.DE", "RENK.F"],
 }
 
 
@@ -53,6 +54,9 @@ def _yahoo_candidates(symbol: str, name: str | None = None) -> list[str]:
     if normalized_symbol:
         candidates.append(normalized_symbol)
         candidates.extend(ING_SYMBOL_ALIASES.get(normalized_symbol, []))
+        stripped_symbol = normalized_symbol.rstrip("0123456789")
+        if stripped_symbol and stripped_symbol != normalized_symbol:
+            candidates.append(stripped_symbol)
     if name:
         normalized_name = name.strip()
         if normalized_name:
@@ -141,7 +145,11 @@ def calculate_max_drawdown(prices: list[float]) -> float:
     return max_drawdown
 
 
-def portfolio_metrics(current_prices: dict[str, float], db_path: str | None = None) -> dict:
+def portfolio_metrics(
+    current_prices: dict[str, float],
+    db_path: str | None = None,
+    allow_remote_price_lookup: bool = True,
+) -> dict:
     positions = list_positions(db_path)
     latest_prices = _latest_quote_prices(db_path)
     total_cost = 0.0
@@ -160,7 +168,7 @@ def portfolio_metrics(current_prices: dict[str, float], db_path: str | None = No
         if current_price is None:
             current_price = _positive_float(latest_prices.get(symbol))
             price_source = "stored_quote"
-        if current_price is None:
+        if current_price is None and allow_remote_price_lookup:
             current_price = _yahoo_quote_price(symbol, name)
             if current_price is not None:
                 price_source = "yahoo_finance"
@@ -214,18 +222,16 @@ def portfolio_risk_snapshot(holdings: list[dict], current_prices: dict[str, floa
         symbol = str(holding.get("symbol", "")).upper()
         quantity = float(holding.get("quantity", 0.0))
         average_price = float(holding.get("average_price", 0.0))
-        current_price = current_prices.get(symbol)
+        current_price = _positive_float(current_prices.get(symbol))
         if current_price is None:
-            current_price = float(holding.get("current_price", average_price))
             if symbol and symbol not in missing_price_symbols:
                 missing_price_symbols.append(symbol)
-        current_price = float(current_price)
         cost = quantity * average_price
-        value = quantity * current_price
-        pnl = value - cost
-        pnl_percent = (pnl / cost) if cost else 0.0
+        value = quantity * current_price if current_price is not None else None
+        pnl = (value - cost) if value is not None else None
+        pnl_percent = (pnl / cost) if (pnl is not None and cost) else None
         total_cost += cost
-        total_value += value
+        total_value += value if value is not None else 0.0
         analyzed_holdings.append(
             {
                 "symbol": symbol,
@@ -244,12 +250,13 @@ def portfolio_risk_snapshot(holdings: list[dict], current_prices: dict[str, floa
         for holding in analyzed_holdings:
             holding["weight"] = holding["value"] / total_value
 
-    winners = sum(1 for holding in analyzed_holdings if holding["pnl"] >= 0)
-    losers = sum(1 for holding in analyzed_holdings if holding["pnl"] < 0)
+    winners = sum(1 for holding in analyzed_holdings if holding["pnl"] is not None and holding["pnl"] > 0)
+    losers = sum(1 for holding in analyzed_holdings if holding["pnl"] is not None and holding["pnl"] < 0)
     largest_position = max((holding["weight"] for holding in analyzed_holdings), default=0.0)
     top_weighted = sorted(analyzed_holdings, key=lambda item: item["weight"], reverse=True)[:3]
-    top_winners = sorted(analyzed_holdings, key=lambda item: item["pnl"], reverse=True)[:3]
-    top_losers = sorted(analyzed_holdings, key=lambda item: item["pnl"])[:3]
+    priced_holdings = [holding for holding in analyzed_holdings if holding["pnl"] is not None]
+    top_winners = sorted(priced_holdings, key=lambda item: item["pnl"], reverse=True)[:3]
+    top_losers = sorted(priced_holdings, key=lambda item: item["pnl"])[:3]
 
     concentration_risk = "low"
     if largest_position >= 0.5:

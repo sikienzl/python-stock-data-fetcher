@@ -46,6 +46,7 @@ from trading import (
     update_position,
     update_price_alert,
 )
+from trading.core.portfolio import DEFAULT_PORTFOLIO_DB_PATH
 from trading.providers.currentsapi import CurrentsAPIClient
 from trading.core.rate_limit import get_provider_min_interval
 
@@ -152,14 +153,7 @@ def _news_snapshot() -> dict:
     if isinstance(cached_at, (int, float)) and cached_payload and (now - float(cached_at)) < _NEWS_REFRESH_SECONDS:
         return cached_payload  # type: ignore[return-value]
 
-    try:
-        payload = fetch_trading_news(symbol="AAPL")
-    except Exception as error:
-        payload = {"error": str(error)}
-
-    _NEWS_CACHE["updated_at"] = now
-    _NEWS_CACHE["payload"] = payload
-    return payload
+    return cached_payload if isinstance(cached_payload, dict) else {"finnhub": {}, "alpha_vantage": {}, "currents": {}}
 
 
 def _position_comparison_snapshot() -> list[dict]:
@@ -172,7 +166,7 @@ def _position_comparison_snapshot() -> list[dict]:
     comparisons: list[dict] = []
     try:
         holdings = sorted(
-            portfolio_metrics({}).get("holdings", []),
+            portfolio_metrics({}, allow_remote_price_lookup=False).get("holdings", []),
             key=lambda item: float(item.get("value", 0.0)),
             reverse=True,
         )[:3]
@@ -435,7 +429,7 @@ def _refresh_snapshot() -> dict:
     live_quotes: dict[str, dict] = {}
     events: list[dict] = []
 
-    for symbol in tracked_symbols[:8]:
+    for symbol in tracked_symbols[:3]:
         try:
             live_quotes[symbol] = fetch_data(symbol, provider="finnhub", save_to_db=True)
             events.append({"type": "quote", "symbol": symbol, "payload": live_quotes[symbol]})
@@ -467,9 +461,6 @@ def _refresh_snapshot() -> dict:
     for symbol, price in latest_quote_prices.items():
         current_prices.setdefault(symbol, price)
 
-    for position in positions:
-        current_prices.setdefault(position["symbol"], float(position["average_price"]))
-
     names_by_symbol: dict[str, str] = {}
     for position in positions:
         stored_name = (position.get("name") or "").strip()
@@ -477,19 +468,22 @@ def _refresh_snapshot() -> dict:
         if stored_name and symbol not in names_by_symbol:
             names_by_symbol[symbol] = stored_name
 
-    metrics = portfolio_metrics(current_prices)
+    metrics = portfolio_metrics(current_prices, allow_remote_price_lookup=False)
     for holding in metrics.get("holdings", []):
         symbol = holding["symbol"]
-        api_name = _resolve_symbol_name(symbol)
         stored_name = names_by_symbol.get(symbol) or holding.get("name")
-        if api_name and api_name != symbol:
+        if stored_name and not _looks_like_placeholder_name(stored_name, symbol):
+            holding["name"] = stored_name
+            continue
+
+        api_name = _resolve_symbol_name(symbol)
+        if api_name and not _looks_like_placeholder_name(api_name, symbol):
             holding["name"] = api_name
         else:
             holding["name"] = stored_name or api_name
     portfolio_health = portfolio_risk_snapshot(metrics.get("holdings", []), current_prices)
     open_alerts = sum(1 for item in alerts if item["active"])
     news = _news_snapshot()
-    agent_signals = _agent_signal_snapshot()
     snapshot = {
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "positions": positions,
@@ -502,7 +496,8 @@ def _refresh_snapshot() -> dict:
         "open_alerts": open_alerts,
         "events": events,
         "news": news,
-        "agent_signals": agent_signals,
+        "position_comparisons": [],
+        "agent_signals": [],
     }
     return snapshot
 
@@ -684,7 +679,7 @@ def _render_dashboard(import_message: str | None = None) -> str:
     portfolio_health = snapshot.get("portfolio_health", {})
     alerts_open = snapshot.get("open_alerts", 0)
     news = snapshot.get("news", {})
-    position_comparisons = _position_comparison_snapshot()
+    position_comparisons = snapshot.get("position_comparisons", [])
     agent_signals = snapshot.get("agent_signals", [])
     patterns = detect_candlestick_patterns([])
     bad_quote_symbols = [
@@ -806,6 +801,7 @@ def _render_dashboard(import_message: str | None = None) -> str:
 
         <section class="full">
             <h2>Portfolio</h2>
+            <p class="muted">Reading positions from {escape(str(DEFAULT_PORTFOLIO_DB_PATH))}. If this table is empty, no positions are stored in that database yet.</p>
             {_render_grouped_portfolio(metrics.get('holdings', []))}
         </section>
 
