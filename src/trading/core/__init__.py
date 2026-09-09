@@ -6,7 +6,7 @@ from .comparison import compare_providers
 from .export import export_to_csv, export_to_json
 from .notifications import send_email_message, send_telegram_message
 from .fetch_data import analyze_prices, fetch_data
-from .performance import calculate_max_drawdown, calculate_sharpe_ratio, portfolio_metrics
+from .performance import calculate_max_drawdown, calculate_sharpe_ratio, portfolio_metrics, portfolio_risk_snapshot
 from .portfolio import add_position, delete_all_positions, delete_position, delete_positions_by_source, import_positions_from_csv, import_positions_from_pdf, list_positions, portfolio_value, update_position
 from .risk import calculate_position_size, calculate_stop_loss
 from .rate_limit import get_provider_min_interval, wait_for_provider_interval
@@ -47,6 +47,7 @@ __all__ = [
     "moving_average_crossover_backtest",
     "wait_for_provider_interval",
     "portfolio_metrics",
+    "portfolio_risk_snapshot",
     "load_quotes",
     "portfolio_value",
     "update_position",

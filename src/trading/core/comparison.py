@@ -9,7 +9,7 @@ def compare_providers(symbol: str, providers: list[str] | None = None) -> dict:
 
     for provider in providers:
         try:
-            results[provider] = fetch_data(symbol, provider=provider, save_to_db=False)
+            results[provider] = fetch_data(symbol, provider=provider, save_to_db=False, wait_for_interval=False)
         except Exception as error:
             results[provider] = {"error": str(error)}
 

@@ -4,10 +4,11 @@ from .storage import save_quote
 from ..providers import FinnhubClient, AlphaVantageClient
 from ..analysis.indicators import calculate_ema, calculate_macd, calculate_rsi, calculate_sma
 
-def fetch_data(symbol: str, provider: str = "finnhub", save_to_db: bool = True, **kwargs):
+def fetch_data(symbol: str, provider: str = "finnhub", save_to_db: bool = True, wait_for_interval: bool = True, **kwargs):
     """Fetch stock data from the specified provider."""
     api_key = get_api_key(provider)
-    wait_for_provider_interval(provider)
+    if wait_for_interval:
+        wait_for_provider_interval(provider)
     if provider == "finnhub":
         client = FinnhubClient(api_key)
         quote = client.get_quote(symbol, **kwargs)

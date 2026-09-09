@@ -39,11 +39,14 @@ from trading import (
     import_positions_from_pdf,
     get_api_key,
     fetch_trading_news,
+    compare_providers,
     portfolio_metrics,
+    portfolio_risk_snapshot,
     portfolio_value,
     update_position,
     update_price_alert,
 )
+from trading.providers.currentsapi import CurrentsAPIClient
 from trading.core.rate_limit import get_provider_min_interval
 
 
@@ -117,6 +120,18 @@ EVENT_HUB = LiveUpdateHub()
 _NAME_CACHE: dict[str, str] = {}
 _NEWS_CACHE: dict[str, object] = {"updated_at": None, "payload": None}
 _NEWS_REFRESH_SECONDS = 1800
+_POSITION_COMPARE_CACHE: dict[str, object] = {"updated_at": None, "payload": None}
+_POSITION_COMPARE_REFRESH_SECONDS = 1800
+_AGENT_SIGNAL_CACHE: dict[str, object] = {"updated_at": None, "payload": None}
+_AGENT_SIGNAL_REFRESH_SECONDS = 1800
+
+
+def _positive_float(value: object) -> float | None:
+    try:
+        numeric_value = float(value)
+    except Exception:
+        return None
+    return numeric_value if numeric_value > 0 else None
 
 
 def _tracked_symbols() -> list[str]:
@@ -145,6 +160,133 @@ def _news_snapshot() -> dict:
     _NEWS_CACHE["updated_at"] = now
     _NEWS_CACHE["payload"] = payload
     return payload
+
+
+def _position_comparison_snapshot() -> list[dict]:
+    now = time.time()
+    cached_at = _POSITION_COMPARE_CACHE.get("updated_at")
+    cached_payload = _POSITION_COMPARE_CACHE.get("payload")
+    if isinstance(cached_at, (int, float)) and cached_payload and (now - float(cached_at)) < _POSITION_COMPARE_REFRESH_SECONDS:
+        return cached_payload  # type: ignore[return-value]
+
+    comparisons: list[dict] = []
+    try:
+        holdings = sorted(
+            portfolio_metrics({}).get("holdings", []),
+            key=lambda item: float(item.get("value", 0.0)),
+            reverse=True,
+        )[:3]
+        symbols = [str(item.get("symbol")) for item in holdings if item.get("symbol")]
+        for symbol in symbols:
+            try:
+                comparison = compare_providers(symbol, providers=["finnhub", "alpha_vantage"])
+                currents_news = CurrentsAPIClient().search_news(keywords=symbol)
+                current_coverage = {
+                    provider: bool(
+                        isinstance(payload, dict)
+                        and not payload.get("error")
+                        and (payload.get("c") not in (None, 0) or payload.get("price") not in (None, 0))
+                    )
+                    for provider, payload in comparison.get("results", {}).items()
+                }
+            except Exception as error:
+                comparison = {"symbol": symbol, "error": str(error)}
+                currents_news = None
+                current_coverage = {}
+            comparison["currents_news"] = currents_news
+            comparison["coverage"] = current_coverage
+            comparisons.append(comparison)
+    except Exception as error:
+        comparisons = [{"error": str(error)}]
+
+    _POSITION_COMPARE_CACHE["updated_at"] = now
+    _POSITION_COMPARE_CACHE["payload"] = comparisons
+    return comparisons
+
+
+def _agent_signal_snapshot() -> list[dict]:
+    now = time.time()
+    cached_at = _AGENT_SIGNAL_CACHE.get("updated_at")
+    cached_payload = _AGENT_SIGNAL_CACHE.get("payload")
+    if isinstance(cached_at, (int, float)) and cached_payload and (now - float(cached_at)) < _AGENT_SIGNAL_REFRESH_SECONDS:
+        return cached_payload  # type: ignore[return-value]
+
+    signals: list[dict] = []
+    for item in _position_comparison_snapshot():
+        if item.get("error"):
+            signals.append({
+                "symbol": item.get("symbol", "n/a"),
+                "signal": "review",
+                "score": 0,
+                "confidence": 0,
+                "reason": str(item.get("error")),
+                "currents_titles": [],
+                "coverage": {},
+            })
+            continue
+
+        results = item.get("results", {}) if isinstance(item, dict) else {}
+        coverage = item.get("coverage", {}) if isinstance(item, dict) else {}
+        currents_news = item.get("currents_news") if isinstance(item, dict) else None
+
+        provider_hits = sum(1 for value in coverage.values() if value)
+        currents_titles = [
+            str(entry.get("title", "untitled"))
+            for entry in currents_news.get("news", [])[:3]
+            if isinstance(currents_news, dict) and isinstance(entry, dict)
+        ] if isinstance(currents_news, dict) else []
+
+        def _price_from(payload: object) -> float | None:
+            if not isinstance(payload, dict) or payload.get("error"):
+                return None
+            value = payload.get("c") if payload.get("c") not in (None, 0) else payload.get("price")
+            try:
+                return float(value) if value not in (None, 0) else None
+            except Exception:
+                return None
+
+        prices = [price for price in (_price_from(results.get("finnhub")), _price_from(results.get("alpha_vantage"))) if price is not None]
+        pnl_percent = float(item.get("pnl_percent", 0.0)) if isinstance(item, dict) else 0.0
+        pnl_value = float(item.get("pnl", 0.0)) if isinstance(item, dict) else 0.0
+
+        score = provider_hits * 25
+        if prices:
+            score += 20
+        if currents_titles:
+            score += min(20, len(currents_titles) * 6)
+
+        if provider_hits == 0 and not prices and not currents_titles:
+            signal = "review"
+        elif pnl_percent <= -0.2 and pnl_value < 0:
+            signal = "sell_candidate"
+        elif pnl_percent <= -0.08 and pnl_value < 0:
+            signal = "reduce_candidate"
+        elif score >= 60:
+            signal = "buy_candidate"
+        elif score >= 25:
+            signal = "watch"
+        else:
+            signal = "review"
+
+        reason_bits = [f"provider hits {provider_hits}/2"]
+        reason_bits.append(f"currents headlines {len(currents_titles)}")
+        reason_bits.append("price data available" if prices else "missing price data")
+
+        signals.append({
+            "symbol": item.get("symbol", "n/a"),
+            "signal": signal,
+            "score": score,
+            "confidence": min(100, score),
+            "pnl": pnl_value,
+            "pnl_percent": pnl_percent,
+            "reason": "; ".join(reason_bits),
+            "currents_titles": currents_titles,
+            "coverage": coverage,
+        })
+
+    _AGENT_SIGNAL_CACHE["updated_at"] = now
+    _AGENT_SIGNAL_CACHE["payload"] = signals
+    return signals
 
 
 def _resolve_symbol_name(symbol: str) -> str | None:
@@ -200,6 +342,91 @@ def _looks_like_placeholder_name(name: str | None, symbol: str) -> bool:
     return False
 
 
+def _status_badge(label: str, tone: str = "neutral") -> str:
+    colors = {
+        "ok": "#153a2a; color:#7df0b2; border:1px solid rgba(125,240,178,.35);",
+        "weak": "#3b2a12; color:#ffd27d; border:1px solid rgba(255,210,125,.35);",
+        "bad": "#3a1515; color:#ff9a9a; border:1px solid rgba(255,154,154,.35);",
+        "neutral": "#273042; color:#d5dcff; border:1px solid rgba(213,220,255,.25);",
+    }
+    style = colors.get(tone, colors["neutral"])
+    return f'<span class="pill" style="display:inline-block;padding:0.15rem 0.5rem;border-radius:999px;font-size:0.78rem;line-height:1.4;background:{style}">{escape(label)}</span>'
+
+
+def _provider_display_name(provider: str) -> str:
+    return {
+        "finnhub": "Finnhub",
+        "alpha_vantage": "Alpha Vantage",
+        "currents": "Currents",
+    }.get(provider, provider)
+
+
+def _normalize_agent_position(item: dict) -> dict:
+    signal = str(item.get("signal", "review"))
+    coverage = item.get("coverage", {}) if isinstance(item.get("coverage"), dict) else {}
+    currents_titles = item.get("currents_titles", []) if isinstance(item.get("currents_titles"), list) else []
+    return {
+        "symbol": str(item.get("symbol", "n/a")).upper(),
+        "signal": signal,
+        "score": int(item.get("score", 0)),
+        "confidence": int(item.get("confidence", 0)),
+        "pnl": float(item.get("pnl", 0.0)),
+        "pnl_percent": float(item.get("pnl_percent", 0.0)),
+        "reason": str(item.get("reason", "")),
+        "coverage": {
+            "finnhub": bool(coverage.get("finnhub")),
+            "alpha_vantage": bool(coverage.get("alpha_vantage")),
+        },
+        "currents_titles": [str(title) for title in currents_titles[:3]],
+        "action_hint": "buy" if signal == "buy_candidate" else "reduce" if signal == "reduce_candidate" else "sell" if signal == "sell_candidate" else "watch" if signal == "watch" else "review",
+    }
+
+
+def _agent_api_payload(snapshot: dict | None = None) -> dict:
+    snapshot = snapshot or STATE.get()
+    metrics = snapshot.get("metrics", {}) if isinstance(snapshot, dict) else {}
+    portfolio_health = snapshot.get("portfolio_health", {}) if isinstance(snapshot, dict) else {}
+    agent_signals = snapshot.get("agent_signals", []) if isinstance(snapshot, dict) else []
+    live_quotes = snapshot.get("live_quotes", {}) if isinstance(snapshot, dict) else {}
+
+    risk_level = "low"
+    if isinstance(portfolio_health, dict):
+        risk_level = str(portfolio_health.get("concentration_risk", "low"))
+
+    normalized_positions = [_normalize_agent_position(item) for item in agent_signals] if isinstance(agent_signals, list) else []
+
+    signal_counts: dict[str, int] = {}
+    for item in normalized_positions:
+        signal_name = str(item.get("signal", "review"))
+        signal_counts[signal_name] = signal_counts.get(signal_name, 0) + 1
+
+    summary = {
+        "total_pnl": metrics.get("total_pnl", 0.0),
+        "roi": metrics.get("roi", 0.0),
+        "sharpe_ratio": metrics.get("sharpe_ratio", 0.0),
+        "max_drawdown": metrics.get("max_drawdown", 0.0),
+        "position_count": portfolio_health.get("position_count", 0) if isinstance(portfolio_health, dict) else 0,
+        "winners": portfolio_health.get("winners", 0) if isinstance(portfolio_health, dict) else 0,
+        "losers": portfolio_health.get("losers", 0) if isinstance(portfolio_health, dict) else 0,
+        "concentration_risk": risk_level,
+    }
+
+    return {
+        "updated_at": snapshot.get("updated_at"),
+        "summary": summary,
+        "positions": normalized_positions,
+        "agent_signals": normalized_positions,
+        "portfolio_health": portfolio_health,
+        "data_quality": {
+            "tracked_symbols": snapshot.get("tracked_symbols", []),
+            "live_quote_count": len(live_quotes) if isinstance(live_quotes, dict) else 0,
+            "missing_price_symbols": portfolio_health.get("missing_price_symbols", []) if isinstance(portfolio_health, dict) else [],
+        },
+        "signal_counts": signal_counts,
+        "decision_hint": "review" if risk_level == "high" else "watch",
+    }
+
+
 def _refresh_snapshot() -> dict:
     positions = list_positions()
     alerts = list_price_alerts()
@@ -217,10 +444,28 @@ def _refresh_snapshot() -> dict:
 
     current_prices: dict[str, float] = {}
     for symbol, payload in live_quotes.items():
-        if isinstance(payload, dict) and payload.get("c") is not None:
-            current_prices[symbol] = float(payload["c"])
-        elif isinstance(payload, dict) and payload.get("price") is not None:
-            current_prices[symbol] = float(payload["price"])
+        live_value = None
+        if isinstance(payload, dict):
+            live_value = payload.get("c") if payload.get("c") not in (None, 0) else payload.get("price")
+        positive_live_value = _positive_float(live_value)
+        if positive_live_value is not None:
+            current_prices[symbol] = positive_live_value
+
+    latest_quote_prices: dict[str, float] = {}
+    for quote in quote_history:
+        if not isinstance(quote, dict):
+            continue
+        symbol = str(quote.get("symbol") or "").upper()
+        payload = quote.get("payload") if isinstance(quote.get("payload"), dict) else None
+        if not symbol or symbol in latest_quote_prices or not isinstance(payload, dict):
+            continue
+        value = payload.get("c") if payload.get("c") not in (None, 0) else payload.get("price")
+        positive_value = _positive_float(value)
+        if positive_value is not None:
+            latest_quote_prices[symbol] = positive_value
+
+    for symbol, price in latest_quote_prices.items():
+        current_prices.setdefault(symbol, price)
 
     for position in positions:
         current_prices.setdefault(position["symbol"], float(position["average_price"]))
@@ -241,8 +486,10 @@ def _refresh_snapshot() -> dict:
             holding["name"] = api_name
         else:
             holding["name"] = stored_name or api_name
+    portfolio_health = portfolio_risk_snapshot(metrics.get("holdings", []), current_prices)
     open_alerts = sum(1 for item in alerts if item["active"])
     news = _news_snapshot()
+    agent_signals = _agent_signal_snapshot()
     snapshot = {
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "positions": positions,
@@ -250,10 +497,12 @@ def _refresh_snapshot() -> dict:
         "quotes": quote_history[:20],
         "live_quotes": live_quotes,
         "metrics": metrics,
+        "portfolio_health": portfolio_health,
         "tracked_symbols": tracked_symbols,
         "open_alerts": open_alerts,
         "events": events,
         "news": news,
+        "agent_signals": agent_signals,
     }
     return snapshot
 
@@ -301,7 +550,6 @@ def _wrap_page(title: str, body: str) -> str:
     header {{ padding: 24px; border-bottom: 1px solid rgba(255,255,255,.08); background: rgba(9,14,30,.55); position: sticky; top: 0; backdrop-filter: blur(16px); }}
     h1, h2, h3 {{ margin: 0 0 12px; }}
     main {{ padding: 24px; display: grid; gap: 18px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }}
-    section {{ background: rgba(17,26,51,.88); border: 1px solid rgba(255,255,255,.08); border-radius: 18px; padding: 18px; box-shadow: 0 18px 40px rgba(0,0,0,.24); }}
     .full {{ grid-column: 1 / -1; }}
     .muted {{ color: var(--muted); }}
     .stat-grid {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 12px; }}
@@ -310,7 +558,6 @@ def _wrap_page(title: str, body: str) -> str:
     .value {{ font-size: 1.4rem; font-weight: 700; margin-top: 6px; }}
     table {{ width: 100%; border-collapse: collapse; }}
     th, td {{ padding: 10px 8px; border-bottom: 1px solid rgba(255,255,255,.08); text-align: left; }}
-    th {{ color: var(--muted); font-weight: 600; }}
     input, select, button {{ width: 100%; padding: 10px 12px; border-radius: 12px; border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.04); color: var(--text); }}
     form {{ display: grid; gap: 10px; }}
     button {{ background: linear-gradient(135deg, var(--accent), var(--accent2)); color: #07111f; font-weight: 700; cursor: pointer; border: none; }}
@@ -376,7 +623,11 @@ def _render_grouped_portfolio(holdings: list[dict]) -> str:
         grouped.setdefault(str(item.get("source", "manual")), []).append(item)
 
     if not grouped:
-        return '<p class="muted">No positions stored.</p>'
+        return (
+            '<table><thead><tr><th>#</th><th>Name</th><th>Symbol</th><th>Quantity</th><th>Avg Price</th>'
+            '<th>Current Price</th><th>Price Source</th><th>Profit/Loss (PnL)</th><th>Action</th></tr></thead>'
+            '<tbody><tr><td colspan="9" class="muted">No positions stored. Price Source and Profit/Loss (PnL) appear here once holdings are imported.</td></tr></tbody></table>'
+        )
 
     sections: list[str] = []
     row_number = 1
@@ -385,12 +636,19 @@ def _render_grouped_portfolio(holdings: list[dict]) -> str:
         table_rows = []
         for item in rows:
             display_name = item.get("name")
+            pnl_value = item.get("pnl")
+            pnl_percent = item.get("pnl_percent")
+            price_source = str(item.get("price_source", "missing"))
+            current_price = item.get("current_price")
+            pnl_text = "n/a"
+            if pnl_value is not None and pnl_percent is not None:
+                pnl_text = f"EUR {float(pnl_value):.2f} ({float(pnl_percent) * 100:+.2f}%)"
             table_rows.append(
-                f"<tr><td>{row_number}</td><td>{escape(str(display_name)) if display_name else '<span class=\"muted\">Name unavailable</span>'}</td><td>{escape(str(item['symbol']))}</td><td>{item['quantity']}</td><td>{item['average_price']}</td><td>{item['current_price']}</td><td>{item['pnl']:.4f}</td><td>{_render_position_action(item)}</td></tr>"
+                f"<tr data-price_source=\"{escape(price_source)}\"><td>{row_number}</td><td>{escape(str(display_name)) if display_name else '<span class=\"muted\">Name unavailable</span>'}</td><td>{escape(str(item['symbol']))}</td><td>{item['quantity']}</td><td>{item['average_price']}</td><td>{current_price if current_price is not None else '<span class=\"muted\">n/a</span>'}</td><td>{escape(price_source)}</td><td>{pnl_text}</td><td>{_render_position_action(item)}</td></tr>"
             )
             row_number += 1
         sections.append(
-            f'<h3>{escape(source)}</h3><table><thead><tr><th>#</th><th>Name</th><th>Symbol</th><th>Quantity</th><th>Avg Price</th><th>Current Price</th><th>PnL</th><th>Action</th></tr></thead><tbody>{"".join(table_rows)}</tbody></table>'
+            f'<h3>{escape(source)}</h3><table><thead><tr><th>#</th><th>Name</th><th>Symbol</th><th>Quantity</th><th>Avg Price</th><th>Current Price</th><th>Price Source</th><th>Profit/Loss (PnL)</th><th>Action</th></tr></thead><tbody>{"".join(table_rows)}</tbody></table>'
         )
     return ''.join(sections)
 
@@ -423,9 +681,16 @@ def _render_dashboard(import_message: str | None = None) -> str:
     latest_quotes = snapshot.get("quotes", [])[:8]
     live_quotes = snapshot.get("live_quotes", {})
     metrics = snapshot.get("metrics", {})
+    portfolio_health = snapshot.get("portfolio_health", {})
     alerts_open = snapshot.get("open_alerts", 0)
     news = snapshot.get("news", {})
+    position_comparisons = _position_comparison_snapshot()
+    agent_signals = snapshot.get("agent_signals", [])
     patterns = detect_candlestick_patterns([])
+    bad_quote_symbols = [
+        symbol for symbol, payload in live_quotes.items()
+        if not isinstance(payload, dict) or payload.get("error") or payload.get("c") in (None, 0) and payload.get("price") in (None, 0)
+    ]
 
     def _render_news_section() -> str:
         if not isinstance(news, dict):
@@ -445,48 +710,136 @@ def _render_dashboard(import_message: str | None = None) -> str:
                 cards.append(_stats_card(provider, "Available"))
         return f'<div class="stat-grid">{"".join(cards)}</div>'
 
-    body = f"""
-        {f'<section><p class="muted">{escape(import_message)}</p></section>' if import_message else ''}
+    def _render_position_comparison_section() -> str:
+        if not position_comparisons:
+            return '<p class="muted">No comparison data available.</p>'
 
-    <section>
-      <h2>Overview</h2>
-      <p class=\"muted\" data-dashboard-status>Waiting for first refresh...</p>
-      <div class=\"stat-grid\">
+        cards: list[str] = []
+        for item in position_comparisons:
+            symbol = escape(str(item.get("symbol", "n/a")))
+            if item.get("error"):
+                cards.append(f'<div class="stat"><div class="label">{symbol}</div><div class="value muted">{escape(str(item["error"]))}</div></div>')
+                continue
+            results = item.get("results", {}) if isinstance(item, dict) else {}
+            coverage = item.get("coverage", {}) if isinstance(item, dict) else {}
+            lines: list[str] = []
+            for provider in ("finnhub", "alpha_vantage"):
+                payload = results.get(provider) if isinstance(results, dict) else None
+                if isinstance(payload, dict) and payload.get("error"):
+                    value = payload.get("error")
+                elif isinstance(payload, dict):
+                    value = payload.get("c") or payload.get("price") or "ok"
+                else:
+                    value = "n/a"
+                ok = coverage.get(provider)
+                state = 'ok' if ok else 'weak'
+                lines.append(f'<div>{_status_badge(_provider_display_name(provider), "ok" if ok else "weak")} {_status_badge(state, "ok" if ok else "weak")} {escape(str(value))}</div>')
+            currents_news = item.get("currents_news")
+            if isinstance(currents_news, dict) and currents_news.get("news"):
+                top_titles = [str(entry.get("title", "untitled")) for entry in currents_news.get("news", [])[:2] if isinstance(entry, dict)]
+                lines.append(f'<div>{_status_badge("Currents News", "ok")} {escape(" | ".join(top_titles) or "news available")}</div>')
+            else:
+                lines.append(f'<div>{_status_badge("Currents News", "weak")} <span class="muted">No news</span></div>')
+            coverage_summary = sum(1 for value in coverage.values() if value)
+            cards.append(f'<div class="stat"><div class="label">{symbol}</div><div class="value">{coverage_summary}/2 providers</div><div>{"".join(lines)}</div></div>')
+        return f'<div class="stat-grid">{"".join(cards)}</div>'
+
+    def _render_agent_signal_section() -> str:
+        if not isinstance(agent_signals, list) or not agent_signals:
+            return '<p class="muted">No agent signals available.</p>'
+
+        cards: list[str] = []
+        for item in agent_signals:
+            symbol = escape(str(item.get("symbol", "n/a")))
+            signal = str(item.get("signal", "review"))
+            tone = "ok" if signal in {"buy_candidate", "accumulate"} else "weak" if signal in {"watch", "hold"} else "bad"
+            border = "rgba(125,240,178,.45)" if signal in {"buy_candidate", "accumulate"} else "rgba(255,210,125,.38)" if signal in {"watch", "hold"} else "rgba(255,154,154,.32)"
+            cards.append(
+                f'<div class="stat" style="border:1px solid {border}; box-shadow: 0 0 0 1px {border};">'
+                f'<div class="label">{symbol}</div>'
+                f'<div class="value">{_status_badge(signal.replace("_", " "), tone)} score {item.get("score", 0)} / conf {item.get("confidence", 0)}%</div>'
+                f'<div class="muted">{escape(str(item.get("reason", "")))}</div>'
+                f'<div style="margin-top:8px;">{_status_badge("Currents " + str(len(item.get("currents_titles", []))), "neutral")}</div>'
+                f'</div>'
+            )
+        return f'<div class="stat-grid">{"".join(cards)}</div>'
+
+    def _render_portfolio_health_section() -> str:
+        if not isinstance(portfolio_health, dict) or not portfolio_health:
+            return '<p class="muted">No portfolio health data available.</p>'
+
+        top_weighted = portfolio_health.get("top_weighted", []) if isinstance(portfolio_health.get("top_weighted"), list) else []
+        top_winners = portfolio_health.get("top_winners", []) if isinstance(portfolio_health.get("top_winners"), list) else []
+        top_losers = portfolio_health.get("top_losers", []) if isinstance(portfolio_health.get("top_losers"), list) else []
+        missing_prices = portfolio_health.get("missing_price_symbols", []) if isinstance(portfolio_health.get("missing_price_symbols"), list) else []
+
+        cards = [
+            _stats_card("Positions", str(portfolio_health.get("position_count", 0))),
+            _stats_card("Winners", str(portfolio_health.get("winners", 0))),
+            _stats_card("Losers", str(portfolio_health.get("losers", 0))),
+            _stats_card("Concentration", f"{float(portfolio_health.get('largest_position_weight', 0.0)) * 100:.1f}%"),
+            _stats_card("Concentration Risk", str(portfolio_health.get("concentration_risk", "low")).title()),
+            _stats_card("Missing Prices", ", ".join(missing_prices[:4]) or "None"),
+        ]
+
+        def _list_block(title: str, items: list[dict], key: str) -> str:
+            rows = []
+            for item in items[:3]:
+                symbol = escape(str(item.get("symbol", "n/a")))
+                if key == "weight":
+                    value = f"{float(item.get('weight', 0.0)) * 100:.1f}%"
+                elif key == "pnl_percent":
+                    value = f"{float(item.get('pnl_percent', 0.0)) * 100:+.2f}%"
+                else:
+                    value = f"{float(item.get('pnl', 0.0)):.4f}"
+                rows.append(f"<li>{symbol} - {value}</li>")
+            return f'<div class="stat"><div class="label">{escape(title)}</div><ul>{"".join(rows) or "<li class=\"muted\">None</li>"}</ul></div>'
+
+        cards.append(_list_block("Top Weighted", top_weighted, "weight"))
+        cards.append(_list_block("Top Winners", top_winners, "pnl_percent"))
+        cards.append(_list_block("Top Losers", top_losers, "pnl"))
+        return f'<div class="stat-grid">{"".join(cards)}</div>'
+
+    body = f"""
         {_stats_card('Positions', str(len(positions)))}
         {_stats_card('Open Alerts', str(alerts_open))}
-        {_stats_card('ROI', f"{metrics.get('roi', 0.0):.4f}")}
-        {_stats_card('Sharpe Ratio', f"{metrics.get('sharpe_ratio', 0.0):.4f}")}
-        {_stats_card('Max Drawdown', f"{metrics.get('max_drawdown', 0.0):.4f}")}
-      </div>
-    </section>
 
-    <section>
-                <select name="operator" required>
-                    {_alert_operator_options()}
-                </select>
-      </form>
-    </section>
-
-    <section>
-      <h2>Create Alert</h2>
-      <form method=\"post\" action=\"/alerts/add\">
-        <input name=\"symbol\" placeholder=\"Symbol\" required />
-                <input name="source" placeholder="Source (ING, XTB, manual)" value="manual" />
+        <section class="full">
+            <h2>Portfolio</h2>
             {_render_grouped_portfolio(metrics.get('holdings', []))}
-          <option value=\">\">&gt;</option>
-          <option value=\"<\">&lt;</option>
-          <option value=\">=\">&gt;=</option>
-          <option value=\"<=\">&lt;=</option>
-        </select>
-        <input name=\"target_price\" type=\"number\" step=\"0.0001\" placeholder=\"Target price\" required />
-        <button type=\"submit\">Add Alert</button>
-      </form>
-    </section>
+        </section>
 
-    <section class=\"full\">
-      <h2>Portfolio</h2>
-            {_render_grouped_portfolio(metrics.get('holdings', []))}
-    </section>
+        <section class="full">
+            <h2>Signal Summary</h2>
+            <p class="muted">A compact machine-readable layer for the future agent: health, confidence, and decision hints.</p>
+            <pre>{escape(json.dumps(_agent_api_payload(snapshot), indent=2, default=str))}</pre>
+        </section>
+
+        <section class="full">
+            <h2>Depot Health</h2>
+            <p class="muted">Concentration, winners/losers, and missing price coverage for later agent decisions. Missing Prices are listed below.</p>
+            {_render_portfolio_health_section()}
+        </section>
+
+        <section class="full">
+            <h2>Position Analysis</h2>
+            <p class="muted">Top holdings are checked against Finnhub, Alpha Vantage, and Currents, with caching to keep limits under control.</p>
+            {_render_position_comparison_section()}
+        </section>
+
+        <section class="full">
+            <h2>Agent Signals</h2>
+            <p class="muted">Prepared signals for a future buy/sell assistant. No autotrading; only ranked candidates and reasons.</p>
+            {_render_agent_signal_section()}
+        </section>
+
+        <section class="full">
+            <h2>Data Warnings</h2>
+            <div class="stat-grid">
+                {_stats_card('Weak Quotes', str(len(bad_quote_symbols)))}
+                {_stats_card('Weak Symbols', ', '.join(bad_quote_symbols[:5]) or 'None')}
+            </div>
+        </section>
 
     <section class=\"full\">
       <h2>Alerts</h2>
@@ -648,6 +1001,9 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
         if parsed.path == "/api/compare":
             symbol = parse_qs(parsed.query).get("symbol", ["AAPL"])[0]
             self._send_json(compare_providers(symbol))
+            return
+        if parsed.path == "/api/agent":
+            self._send_json(_agent_api_payload())
             return
         self._send_json({"error": "Not found"}, status=HTTPStatus.NOT_FOUND)
 

@@ -1,5 +1,5 @@
 # python-stock-data-fetcher
-A Python client to fetch stock market data from Finnhub.io and Alpha Vantage APIs.
+A Python client to fetch stock market data from Finnhub.io, Alpha Vantage, and Currents News API.
 
 ## Installation
 Install the package via install script:
@@ -23,7 +23,7 @@ Contributions are welcome! Feel free to:
 The codebase uses a single package root under `src/trading/` for application logic:
 
 * `src/trading/core/` - data fetching, storage, alerts, backtesting, portfolio, and provider comparison
-* `src/trading/providers/` - Finnhub and Alpha Vantage integrations
+* `src/trading/providers/` - Finnhub, Alpha Vantage, and Currents integrations
 * `src/trading/analysis/` - technical indicators and analysis helpers
 * `src/cli.py` - command line entry point
 
@@ -32,8 +32,10 @@ The codebase uses a single package root under `src/trading/` for application log
 ```
 FINNHUB_API_KEY=your_finnhub_key
 ALPHAVANTAGE_API_KEY=your_alpha_vantage_key
+CURRENTS_API_KEY=your_currents_key
 ```
 2. The `.env` file will be automatically loaded when using the client.
+3. Currents API is treated as a news source and has a daily limit of 250 requests by default.
 
 ## **Data Analysis: Technical Indicators**
 The package now includes technical analysis helpers for price series:
@@ -64,7 +66,7 @@ history = load_quotes("AAPL", provider="finnhub")
 ```
 
 ## **Automation & Alerts**
-The CLI now supports price alerts, basic backtesting, portfolio tracking, and provider comparison.
+The CLI now supports price alerts, basic backtesting, portfolio tracking, provider comparison, and signal-style analysis for a future buy/sell assistant.
 
 Examples:
 ```bash
@@ -87,6 +89,8 @@ The CLI now includes extra commands for the next growth steps:
 * `risk` for stop-loss and position sizing.
 * `candles` for simple candlestick pattern detection.
 * `dashboard` for the local web server.
+* `news` for fetching news from Finnhub, Alpha Vantage, and Currents in one run.
+* The dashboard also shows agent-prep signal cards with score, confidence, and reasons, but it does not place trades.
 
 Example usage:
 ```bash
@@ -97,6 +101,7 @@ python3 src/cli.py backtest-compare
 python3 src/cli.py risk
 python3 src/cli.py candles
 python3 src/cli.py dashboard
+python3 src/cli.py news
 ```
 
 ## **Local Web Dashboard**
@@ -104,7 +109,7 @@ The project now includes a lightweight web dashboard that runs without extra dep
 
 * Default URL: `http://0.0.0.0:8000`
 * Works well on a Raspberry Pi or in Docker
-* Shows portfolio metrics, alerts, recent stored quotes, and quick API actions
+* Shows portfolio metrics, alerts, recent stored quotes, a combined news section, provider comparison, data warnings, and agent-prep signal cards
 
 Run it with:
 ```bash
@@ -117,11 +122,16 @@ Available JSON endpoints:
 * `GET /api/portfolio`
 * `GET /api/compare?symbol=AAPL`
 
+News is cached in the dashboard so Currents requests are not spent on every refresh.
+Comparison and signal snapshots are also cached so the three providers can work together without wasting quota.
+
 ## **Advanced Features**
 * Price alerts are stored in SQLite and can be evaluated against live prices.
 * Backtesting currently includes a moving-average crossover strategy.
 * Portfolio positions are stored locally and can be valued against current prices.
 * Provider comparison fetches the same symbol from multiple APIs and returns the results side by side.
+* News aggregation combines Finnhub, Alpha Vantage, and Currents, with Currents limited by its daily quota.
+* The dashboard prepares structured buy/sell-style signals from the combined provider data, but leaves the final decision to a future agent.
 
 ## License
 [Apache License Version 2.0](https://github.com/sikienzl/python-stock-data-fetcher/blob/main/LICENSE)
