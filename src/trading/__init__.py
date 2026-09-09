@@ -40,7 +40,9 @@ from .providers import (
     FinnhubClient,
     FinhubClient,
     AlphaVantageClient,
+    CurrentsAPIClient,
     fetch_finnhub_news,
+    fetch_currents_news,
     fetch_trading_news,
 )
 
@@ -62,6 +64,7 @@ __all__ = [
     "FinnhubClient",
     "FinhubClient",
     "AlphaVantageClient",
+    "CurrentsAPIClient",
     "calculate_max_drawdown",
     "calculate_position_size",
     "calculate_sharpe_ratio",
@@ -78,6 +81,7 @@ __all__ = [
     "list_price_alerts",
     "load_quotes",
     "fetch_finnhub_news",
+    "fetch_currents_news",
     "fetch_trading_news",
     "moving_average_crossover_backtest",
     "portfolio_metrics",

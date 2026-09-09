@@ -14,6 +14,8 @@ def _default_interval(provider: str) -> float:
         return float(os.getenv("FINNHUB_MIN_INTERVAL_SECONDS", "1.0"))
     if provider == "alpha_vantage":
         return float(os.getenv("ALPHA_VANTAGE_MIN_INTERVAL_SECONDS", "15.0"))
+    if provider == "currents":
+        return float(os.getenv("CURRENTS_MIN_INTERVAL_SECONDS", "1.0"))
     return 0.0
 
 

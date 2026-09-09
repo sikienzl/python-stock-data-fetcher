@@ -38,6 +38,7 @@ from trading import (
     import_positions_from_csv,
     import_positions_from_pdf,
     get_api_key,
+    fetch_trading_news,
     portfolio_metrics,
     portfolio_value,
     update_position,
@@ -114,6 +115,8 @@ STATE = DashboardState()
 EVENT_HUB = LiveUpdateHub()
 
 _NAME_CACHE: dict[str, str] = {}
+_NEWS_CACHE: dict[str, object] = {"updated_at": None, "payload": None}
+_NEWS_REFRESH_SECONDS = 1800
 
 
 def _tracked_symbols() -> list[str]:
@@ -125,6 +128,23 @@ def _tracked_symbols() -> list[str]:
     for item in load_quotes():
         symbols.add(item["symbol"])
     return sorted(symbols)
+
+
+def _news_snapshot() -> dict:
+    now = time.time()
+    cached_at = _NEWS_CACHE.get("updated_at")
+    cached_payload = _NEWS_CACHE.get("payload")
+    if isinstance(cached_at, (int, float)) and cached_payload and (now - float(cached_at)) < _NEWS_REFRESH_SECONDS:
+        return cached_payload  # type: ignore[return-value]
+
+    try:
+        payload = fetch_trading_news(symbol="AAPL")
+    except Exception as error:
+        payload = {"error": str(error)}
+
+    _NEWS_CACHE["updated_at"] = now
+    _NEWS_CACHE["payload"] = payload
+    return payload
 
 
 def _resolve_symbol_name(symbol: str) -> str | None:
@@ -222,6 +242,7 @@ def _refresh_snapshot() -> dict:
         else:
             holding["name"] = stored_name or api_name
     open_alerts = sum(1 for item in alerts if item["active"])
+    news = _news_snapshot()
     snapshot = {
         "updated_at": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
         "positions": positions,
@@ -232,6 +253,7 @@ def _refresh_snapshot() -> dict:
         "tracked_symbols": tracked_symbols,
         "open_alerts": open_alerts,
         "events": events,
+        "news": news,
     }
     return snapshot
 
@@ -402,7 +424,26 @@ def _render_dashboard(import_message: str | None = None) -> str:
     live_quotes = snapshot.get("live_quotes", {})
     metrics = snapshot.get("metrics", {})
     alerts_open = snapshot.get("open_alerts", 0)
+    news = snapshot.get("news", {})
     patterns = detect_candlestick_patterns([])
+
+    def _render_news_section() -> str:
+        if not isinstance(news, dict):
+            return '<p class="muted">No news snapshot available.</p>'
+
+        cards: list[str] = []
+        for provider in ("finnhub", "alpha_vantage", "currents"):
+            payload = news.get(provider)
+            if not payload:
+                cards.append(_stats_card(provider, "No data"))
+                continue
+            if isinstance(payload, dict) and payload.get("news"):
+                items = [item for item in payload.get("news", []) if isinstance(item, dict)][:3]
+                titles = ''.join(f'<li>{escape(str(item.get("title", "untitled")))}</li>' for item in items)
+                cards.append(f'<div class="stat"><div class="label">{escape(provider)}</div><div class="value">{len(items)} items</div><ul>{titles}</ul></div>')
+            else:
+                cards.append(_stats_card(provider, "Available"))
+        return f'<div class="stat-grid">{"".join(cards)}</div>'
 
     body = f"""
         {f'<section><p class="muted">{escape(import_message)}</p></section>' if import_message else ''}
@@ -490,6 +531,11 @@ def _render_dashboard(import_message: str | None = None) -> str:
       </table>
     </section>
 
+        <section class="full">
+            <h2>News Sources</h2>
+            {_render_news_section()}
+        </section>
+
     <section class=\"full\">
       <h2>Quick Actions</h2>
       <p class=\"muted\">Use the CLI or the dashboard forms to add positions and alerts. The API endpoints are available under <span class=\"pill\">/api/*</span>.</p>
@@ -543,19 +589,25 @@ class DashboardRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, payload: dict, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = json.dumps(payload, indent=2, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def _send_html(self, html: str, status: HTTPStatus = HTTPStatus.OK) -> None:
         data = html.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "text/html; charset=utf-8")
-        self.send_header("Content-Length", str(len(data)))
-        self.end_headers()
-        self.wfile.write(data)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError):
+            return
 
     def do_GET(self) -> None:  # noqa: N802
         parsed = urlparse(self.path)

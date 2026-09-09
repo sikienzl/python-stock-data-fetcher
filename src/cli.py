@@ -18,6 +18,7 @@ from trading import (
     evaluate_price_alerts,
     export_to_csv,
     export_to_json,
+    fetch_currents_news,
     fetch_finnhub_news,
     fetch_trading_news,
     fetch_data,
@@ -58,6 +59,9 @@ def news():
 
     click.echo("Fetching Alpha Vantage news...")
     fetch_trading_news()
+
+    click.echo("Fetching Currents API news...")
+    fetch_currents_news()
 
 @cli.command()
 @click.option("--symbol", prompt="Stock symbol", help="The stock symbol to stream.")
